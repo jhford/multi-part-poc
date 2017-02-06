@@ -4,8 +4,17 @@
   "description": "Proof of concept for splitting api calls and actual http request running",
   "main": "index.js",
   "scripts": {
+    "compile": "babel-compile -p taskcluster src:lib",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "John Ford <jhford@mozilla.com>",
-  "license": "ISC"
+  "license": "ISC",
+  "dependencies": {
+    "aws-sdk": "^2.9.0",
+    "aws4": "^1.5.0",
+    "babel-preset-taskcluster": "^3.0.0",
+    "source-map-support": "^0.4.11",
+    "stream-to-buffer": "^0.1.0",
+    "xmljs": "^0.3.2"
+  }
 }
