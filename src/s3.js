@@ -1,11 +1,15 @@
 let http = require('http');
 let https = require('https');
+let urllib = require('url');
 let fs = require('fs');
 let crypto = require('crypto');
 let streamToBuffer = require('stream-to-buffer');
+let _ = require('lodash');
+let assert = require('assert');
 require('source-map-support').install();
 
 let libxmljs = require('libxmljs');
+let xml2json = require('xml2json');
 let aws = require('aws-sdk');
 let s3 = new aws.S3({
   region: 'us-east-1',
@@ -15,10 +19,44 @@ let aws4 = require('aws4');
 const BUCKET = process.env.BUCKET || 'multi-part2';
 const KEY = process.env.KEY || 'test-file';
 const FILE = process.env.FILE || 'rando.dat';
+const REGION = process.env.REGION || 'us-east-1';
+// Default to 25mb
+const CHUNKSIZE = Number.parseInt(process.env.CHUNKSIZE) || 1024 * 1024 * 25
 
 async function fileInfo(file) {
+  let chunkhashes = [];
+  let size = fs.statSync(file).size;
+  let fullChunks = size / CHUNKSIZE;
+  let partialChunk = size % CHUNKSIZE;
+
   let md5 = crypto.createHash('md5');
   let sha256 = crypto.createHash('sha256');
+
+  // Position in the current chunk
+  let positionInC;
+  let cSha256;
+  let cMd5;
+
+  function resetCHash() {
+    if (cMd5 && cSha256) {
+      chunkhashes.push({
+        md5: cMd5.digest('hex'),
+        sha256: cSha256.digest('hex'),
+        size: positionInC,
+      });
+    }
+    positionInC = 0;
+    cSha256 = crypto.createHash('sha256');
+    cMd5 = crypto.createHash('md5');
+  }
+
+  function updateCHash(buf) {
+    cSha256.update(buf);
+    cMd5.update(buf);
+    positionInC += buf.length;
+  }
+
+  resetCHash();
 
   return new Promise((res, rej) => {
     let stream = fs.createReadStream(file);
@@ -28,16 +66,44 @@ async function fileInfo(file) {
       md5.update(data);
       sha256.update(data);
       size += data.length;
+
+      let bytesProcessed = 0;
+
+      // The simple case is that the entire data message is midway through a
+      // chunk.  We'll only do more complex processing in othercases
+      if (data.length + positionInC < data.length) {
+        updateCHash(data);
+      } else {
+        // Look at the buffer starting from here
+        let offset = 0;
+        let buf = data;
+
+        while (data.length - offset > 0) {
+          buf = data.slice(offset);
+          let bytesLeftInC = CHUNKSIZE - positionInC - offset;
+          if (bytesLeftInC > data.length - offset) {
+            // we're reading to the end of the message
+            offset = data.length;
+            updateCHash(buf);
+          } else {
+            let myBuf = data.slice(offset, offset + bytesLeftInC);
+            updateCHash(myBuf);
+            resetCHash();
+            offset += bytesLeftInC
+            buf = buf.slice(offset);
+          }
+        }
+      }
     });
 
     stream.on('end', () => {
       let md5hash = md5.digest('hex');
       let sha256hash = sha256.digest('hex');
-      console.log(`File "${file}" has MD5: ${md5hash}, SHA256: ${sha256hash}`);
       res({
         md5: md5hash,
         sha256: sha256hash,
         size: size,
+        chunkhashes: chunkhashes
       });
     });
     
@@ -115,16 +181,19 @@ function parseAwsResponse(body) {
     throw err;
   }
 
-  //Need to handle this:
-  //  <?xml version="1.0" encoding="UTF-8"?>
-  //<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>multi-part</Bucket><Key>test-file</Key><UploadId>ZOgEVK0dkbQidjy_RoRPKwUYshHz017rM5ayxeGWW_X4W1Ap3vP8wbCNj6qyD9VTRTzAkD9Av5dYCn6yyWyfUjTa54riJ0ZIwWLwmv_SOVJDv33Z1sLHrryKn3LVWb8U</UploadId></InitiateMultipartUploadResult>
+  return xml2json.toJson(body, {object: true});
 }
 
 async function awsRequest(opts) {
-  let fullOpts = aws4.sign(opts);
-  console.log(JSON.stringify(fullOpts, null, 2));
+  opts = _.defaults({}, opts);
+  opts.service = 's3';
+  opts.region = REGION;
+  opts.protocol = 'https:';
+  opts = aws4.sign(opts);
+
+  console.log(JSON.stringify(opts, null, 2));
   return new Promise((res, rej) => {
-    let request = https.request(fullOpts);
+    let request = https.request(opts);
     request.on('error', rej);
 
     console.log('making request');
@@ -143,7 +212,8 @@ async function awsRequest(opts) {
           let body = Buffer.concat(chunks);
           console.log('request complete, ' + body.length + ' bytes');
           if (body.length > 0) {
-            res(parseAwsResponse(body));
+            let response = parseAwsResponse(body);
+            res(response);
           } else {
             res();
           }
@@ -158,27 +228,183 @@ async function awsRequest(opts) {
   });
 }
 
-async function normalMultiPart(fileinfo) {
-  // http://docs.aws.amazon.com/AmazonS3/latest/API/mpUploadInitiate.html
-  let result = await awsRequest({
+async function uploadPart(partinfo, bodyStream) {
+  let method = partinfo.method;
+  let url = partinfo.url;
+  let headers = partinfo.headers;
+
+  console.log('uploading part ' + url);
+  console.dir(partinfo);
+
+  let buffer = await new Promise((res, rej) => {
+    streamToBuffer(bodyStream, (err, buf) => {
+      if (err) rej(err)
+      else res(buf);
+    });
+  });
+
+  return new Promise((res, rej) => {
+    let bitsandbobs = urllib.parse(url);
+    bitsandbobs.headers = headers;
+    bitsandbobs.method = method;
+    let request = https.request(bitsandbobs);
+
+    request.on('error', rej);
+
+    request.on('response', response => {
+      response.on('error', rej);
+      let body = [];
+
+      response.on('data', chunk => {
+        body.push(chunk);
+      });
+
+      response.on('end', () => {
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          res(response.headers.etag);
+        } else {
+          body = Buffer.concat(body);
+          parseAwsResponse(body);
+          // Above line should throw because we only expect a body if there's an error
+          rej();
+        }
+      });
+    });
+
+    request.write(buffer);
+    request.end();
+  });
+}
+
+
+function s3PartInfo(opts, list) {
+  let reqOpts = {
     service: 's3',
-    region: 'us-east-1',
+    region: REGION,
     protocol: 'https:',
+    hostname: `${opts.bucket}.s3.amazonaws.com`,
+    method: 'PUT',
+    path: `/${opts.key}?partNumber=${opts.partnum}&uploadId=${opts.uploadId}`,
+    headers: {
+      // case matters to aws4 library :/
+      'X-Amz-Content-Sha256': opts.sha256,
+      'content-length': opts.size,
+      'content-type': 'application/octet-stream',
+      // No metadata on part upload
+      //'x-amz-meta-header-from-upload-part': 'true',
+    }
+  }
+
+  let signedRequest = aws4.sign(reqOpts)
+
+  list.add(
+    reqOpts.method,
+    reqOpts.protocol + '//' + reqOpts.hostname + reqOpts.path,
+    reqOpts.headers,
+  );
+}
+
+function completeUploadBody(etags) {
+
+}
+
+class RequestList {
+  constructor() {
+    this.requests = [];
+  }
+
+  add(method, url, headers) {
+    this.requests.push({method, url, headers});
+  }
+
+  display() {
+    for (let r of this.requests) {
+      console.log(`METHOD: ${r.method} URL: ${r.url} HEADERS: ${JSON.stringify(r.headers, null, 2)}`);
+    }
+  }
+}
+
+async function normalMultiPart(fileinfo) {
+  let reqList = new RequestList();
+  // This is back to being done on the server
+  // http://docs.aws.amazon.com/AmazonS3/latest/API/mpUploadInitiate.html
+  let initiateUpload = await awsRequest({
     hostname: `${BUCKET}.s3.amazonaws.com`,
     method: 'POST',
     path: `/${KEY}?uploads`,
     headers: {
+      // I want to see which metadata headers from which calls end up staying
+      // on the final object
+      'x-amz-meta-header-from-initiate': 'true',
     }
   });
-  if (result) {
-    console.log(result.toString());
+
+  let uploadId = initiateUpload.InitiateMultipartUploadResult.UploadId;
+  console.log('Got UploadID of ' + uploadId);
+
+  let i = 1;
+  for (let chunk of fileinfo.chunkhashes) {
+    let chunkInfo = s3PartInfo({
+      bucket: BUCKET,
+      key:KEY,
+      partnum: i,
+      uploadId: uploadId,
+      size: chunk.size,
+      sha256: chunk.sha256,
+    }, reqList);
+    i++;
   }
+
+  //reqList.display();
+
+  // not doing this with the RequestList class to ensure that we
+  // can do the requests using serialised data
+  try {
+    for (let x = 0 ; x < reqList.requests.length ; x++) {
+      let start = x * CHUNKSIZE;
+      let end = start + CHUNKSIZE - 1;
+      
+      // ugly, messy code but i just want to double check that we're
+      // correctly getting offsets, etc
+      let lala = crypto.createHash('sha256');
+      let lalasize = 0;
+      let tohash = fs.createReadStream(FILE, {start, end});
+      tohash.on('data', chunk => {
+        lalasize += chunk.length;
+        lala.update(chunk);
+      });
+
+      tohash.on('end', () => {
+        console.log(`True Size: ${lalasize} True sha256: ${lala.digest('hex')}`);
+      });
+
+      let rs = fs.createReadStream(FILE, {start, end});
+
+      let result = await uploadPart(reqList.requests[x], rs);
+      console.dir(result);
+    }
+  } catch (err) {
+    console.log('==================================');
+    console.log('Aborting failed upload');
+    console.dir(err);
+    let abortUpload = await awsRequest({
+      hostname: `${BUCKET}.s3.amazonaws.com`,
+      method: 'DELETE',
+      path: `/${KEY}?uploadId=${uploadId}`,
+      headers: {
+        // I want to see which metadata headers from which calls end up staying
+        // on the final object
+        'x-amz-meta-header-from-abort': 'true',
+      }
+    });
+  }
+
   
-  return result;
 }
 
 async function main() {
   let fileinfo = await fileInfo(FILE);
+  console.log(fileinfo);
   await createBucket();
   await normalMultiPart(fileinfo);
   //await removeBucket();
