@@ -23,6 +23,24 @@ const REGION = process.env.REGION || 'us-east-1';
 // Default to 25mb
 const CHUNKSIZE = Number.parseInt(process.env.CHUNKSIZE) || 1024 * 1024 * 25
 
+// See https://github.com/nodejs/node/issues/2363#issuecomment-278498852
+function parseSession(buf) {
+  return {
+    sessionId: buf.slice(17, 17+32).toString('hex'),
+    masterKey: buf.slice(51, 51+48).toString('hex')
+  };
+}
+
+function wiresharkRequest(req) {
+  req.once('socket', (s) => {
+    s.once('secureConnect', () => {
+      let session = parseSession(s.getSession());
+      // session.sessionId and session.masterKey should be hex strings
+      fs.appendFileSync('sslkeylog.log', `RSA Session-ID:${session.sessionId} Master-Key:${session.masterKey}\n`);
+    });
+  });
+}
+
 async function fileInfo(file) {
   let chunkhashes = [];
   let size = fs.statSync(file).size;
@@ -178,6 +196,24 @@ function parseAwsResponse(body) {
     err.resource = resource;
     err.requestId = requestId;
     err.hostId = hostId;
+
+    if (err.code === 'SignatureDoesNotMatch') {
+      for (let child of children) {
+        switch (child.name()) {
+          case 'AWSAccessKeyId':
+            err.accessKeyId = child.text() || undefined;
+            break;;
+          case 'StringToSign':
+            err.stringToSign = child.text() || undefined;
+            break;;
+          case 'CanonicalRequest':
+            err.canonicalRequest = child.text() || undefined;
+            break;;
+          default:
+            break;;
+        }
+      }
+    }
     throw err;
   }
 
@@ -194,13 +230,16 @@ async function awsRequest(opts) {
   console.log(JSON.stringify(opts, null, 2));
   return new Promise((res, rej) => {
     let request = https.request(opts);
+
+    wiresharkRequest(request);
+
     request.on('error', rej);
 
     console.log('making request');
 
     request.on('response', response => {
       console.log('status code: ' + response.statusCode);
-      console.dir(response.headers);
+      //console.dir(response.headers);
       let chunks = []
 
       response.on('data', chunk => {
@@ -232,22 +271,20 @@ async function uploadPart(partinfo, bodyStream) {
   let method = partinfo.method;
   let url = partinfo.url;
   let headers = partinfo.headers;
+  let uploadId = partinfo.uploadId;
 
   console.log('uploading part ' + url);
   console.dir(partinfo);
-
-  let buffer = await new Promise((res, rej) => {
-    streamToBuffer(bodyStream, (err, buf) => {
-      if (err) rej(err)
-      else res(buf);
-    });
-  });
 
   return new Promise((res, rej) => {
     let bitsandbobs = urllib.parse(url);
     bitsandbobs.headers = headers;
     bitsandbobs.method = method;
+    console.log('Bits and bobs:');
+    console.dir(bitsandbobs);
     let request = https.request(bitsandbobs);
+
+    wiresharkRequest(request);
 
     request.on('error', rej);
 
@@ -260,19 +297,36 @@ async function uploadPart(partinfo, bodyStream) {
       });
 
       response.on('end', () => {
-        if (response.statusCode >= 200 && response.statusCode < 300) {
-          res(response.headers.etag);
-        } else {
-          body = Buffer.concat(body);
-          parseAwsResponse(body);
-          // Above line should throw because we only expect a body if there's an error
-          rej();
+        try {
+          if (response.statusCode >= 200 && response.statusCode < 300) {
+            res(response.headers.etag);
+          } else {
+            body = Buffer.concat(body);
+            //console.log(body.toString());
+            parseAwsResponse(body);
+            // Above line should throw because we only expect a body if there's an error
+            rej();
+          }
+        } catch (err) {
+          rej(err);
         }
       });
     });
 
-    request.write(buffer);
-    request.end();
+    let uploadedB = 0;
+    let uploadedH = crypto.createHash('sha256');
+    bodyStream.on('data', chunk => {
+      uploadedB += chunk.length;
+      uploadedH.update(chunk);
+    });
+
+    bodyStream.on('end', () => {
+      console.log('Uploaded ' + uploadedB + ' bytes with SHA256 of ' + uploadedH.digest('hex'));
+      request.end();
+    });
+
+    bodyStream.pipe(request);
+
   });
 }
 
@@ -298,9 +352,10 @@ function s3PartInfo(opts, list) {
   let signedRequest = aws4.sign(reqOpts)
 
   list.add(
-    reqOpts.method,
-    reqOpts.protocol + '//' + reqOpts.hostname + reqOpts.path,
-    reqOpts.headers,
+    signedRequest.method,
+    signedRequest.protocol + '//' + reqOpts.hostname + reqOpts.path,
+    signedRequest.headers,
+    uploadId,
   );
 }
 
@@ -313,8 +368,8 @@ class RequestList {
     this.requests = [];
   }
 
-  add(method, url, headers) {
-    this.requests.push({method, url, headers});
+  add(method, url, headers, uploadId) {
+    this.requests.push({method, url, headers, uploadId});
   }
 
   display() {
@@ -355,7 +410,7 @@ async function normalMultiPart(fileinfo) {
     i++;
   }
 
-  //reqList.display();
+  reqList.display();
 
   // not doing this with the RequestList class to ensure that we
   // can do the requests using serialised data
@@ -381,11 +436,13 @@ async function normalMultiPart(fileinfo) {
       let rs = fs.createReadStream(FILE, {start, end});
 
       let result = await uploadPart(reqList.requests[x], rs);
-      console.dir(result);
+      //console.dir(result);
+      console.log('uploaded part ' + x);
     }
   } catch (err) {
     console.log('==================================');
     console.log('Aborting failed upload');
+    //console.log(JSON.stringify(err, null, 2));
     console.dir(err);
     let abortUpload = await awsRequest({
       hostname: `${BUCKET}.s3.amazonaws.com`,

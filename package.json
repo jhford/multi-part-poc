@@ -4,6 +4,7 @@
   "description": "Proof of concept for splitting api calls and actual http request running",
   "main": "index.js",
   "scripts": {
+    "start": "npm run compile && node lib/s3.js",
     "compile": "babel-compile -p taskcluster src:lib",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
