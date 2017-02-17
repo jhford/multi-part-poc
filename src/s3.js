@@ -145,7 +145,7 @@ async function createBucket(name=BUCKET) {
       throw err;
     }
   }
-  console.log('created bucket: ' + name);
+  //console.log('created bucket: ' + name);
 }
 
 async function removeBucket(name=BUCKET) {
@@ -158,7 +158,7 @@ async function removeBucket(name=BUCKET) {
       throw err;
     }
   }
-  console.log('removed bucket: ' + name);
+  //console.log('removed bucket: ' + name);
 }
 
 /**
@@ -225,9 +225,11 @@ async function awsRequest(opts) {
   opts.service = 's3';
   opts.region = REGION;
   opts.protocol = 'https:';
+  opts.signQuery = true;
   opts = aws4.sign(opts);
+  console.log(opts);
 
-  console.log(JSON.stringify(opts, null, 2));
+  //console.log(JSON.stringify(opts, null, 2));
   return new Promise((res, rej) => {
     let request = https.request(opts);
 
@@ -235,11 +237,11 @@ async function awsRequest(opts) {
 
     request.on('error', rej);
 
-    console.log('making request');
+    //console.log('making request');
 
     request.on('response', response => {
-      console.log('status code: ' + response.statusCode);
-      //console.dir(response.headers);
+      //console.log('status code: ' + response.statusCode);
+      ////console.dir(response.headers);
       let chunks = []
 
       response.on('data', chunk => {
@@ -249,7 +251,7 @@ async function awsRequest(opts) {
       response.on('end', () => {
         try {
           let body = Buffer.concat(chunks);
-          console.log('request complete, ' + body.length + ' bytes');
+          //console.log('request complete, ' + body.length + ' bytes');
           if (body.length > 0) {
             let response = parseAwsResponse(body);
             res(response);
@@ -272,17 +274,45 @@ async function uploadPart(partinfo, bodyStream) {
   let url = partinfo.url;
   let headers = partinfo.headers;
   let uploadId = partinfo.uploadId;
+  let partnum = partinfo.partnum;
+  let size = partinfo.size;
+  let sha256 = partinfo.sha256;
+  let md5 = partinfo.md5;
 
-  console.log('uploading part ' + url);
-  console.dir(partinfo);
+  //console.log('uploading part ' + url);
+  //console.dir(partinfo);
 
   return new Promise((res, rej) => {
     let bitsandbobs = urllib.parse(url);
     bitsandbobs.headers = headers;
     bitsandbobs.method = method;
-    console.log('Bits and bobs:');
-    console.dir(bitsandbobs);
-    let request = https.request(bitsandbobs);
+    //console.log('Bits and bobs:');
+    //console.dir(bitsandbobs);
+    //let request = https.request(bitsandbobs);
+
+    let reqOpts = {
+      service: 's3',
+      region: REGION,
+      protocol: 'https:',
+      hostname: `${BUCKET}.s3.amazonaws.com`,
+      method: 'PUT',
+      path: `/${KEY}?partNumber=${partnum}&uploadId=${uploadId}`,
+      headers: {
+        // case matters to aws4 library :/
+        'X-Amz-Content-Sha256': sha256,
+        'content-length': size,
+        'content-type': 'application/octet-stream',
+        'content-md5': md5,
+        // No metadata on part upload
+        //'x-amz-meta-header-from-upload-part': 'true',
+      },
+      signQuery: true,
+    }
+
+    let signedOpts = aws4.sign(reqOpts);
+    console.log('Signed Part Upload Opts');
+    console.dir(signedOpts);
+    let request = https.request(signedOpts);
 
     wiresharkRequest(request);
 
@@ -302,7 +332,7 @@ async function uploadPart(partinfo, bodyStream) {
             res(response.headers.etag);
           } else {
             body = Buffer.concat(body);
-            //console.log(body.toString());
+            ////console.log(body.toString());
             parseAwsResponse(body);
             // Above line should throw because we only expect a body if there's an error
             rej();
@@ -322,7 +352,6 @@ async function uploadPart(partinfo, bodyStream) {
 
     bodyStream.on('end', () => {
       console.log('Uploaded ' + uploadedB + ' bytes with SHA256 of ' + uploadedH.digest('hex'));
-      request.end();
     });
 
     bodyStream.pipe(request);
@@ -355,7 +384,11 @@ function s3PartInfo(opts, list) {
     signedRequest.method,
     signedRequest.protocol + '//' + reqOpts.hostname + reqOpts.path,
     signedRequest.headers,
-    uploadId,
+    opts.uploadId,
+    opts.partnum,
+    opts.size,
+    opts.sha256,
+    opts.md5,
   );
 }
 
@@ -368,13 +401,13 @@ class RequestList {
     this.requests = [];
   }
 
-  add(method, url, headers, uploadId) {
-    this.requests.push({method, url, headers, uploadId});
+  add(method, url, headers, uploadId, partnum, size, sha256, md5) {
+    this.requests.push({method, url, headers, uploadId, partnum, size, sha256, md5});
   }
 
   display() {
     for (let r of this.requests) {
-      console.log(`METHOD: ${r.method} URL: ${r.url} HEADERS: ${JSON.stringify(r.headers, null, 2)}`);
+      //console.log(`METHOD: ${r.method} URL: ${r.url} HEADERS: ${JSON.stringify(r.headers, null, 2)}`);
     }
   }
 }
@@ -395,7 +428,7 @@ async function normalMultiPart(fileinfo) {
   });
 
   let uploadId = initiateUpload.InitiateMultipartUploadResult.UploadId;
-  console.log('Got UploadID of ' + uploadId);
+  //console.log('Got UploadID of ' + uploadId);
 
   let i = 1;
   for (let chunk of fileinfo.chunkhashes) {
@@ -406,6 +439,7 @@ async function normalMultiPart(fileinfo) {
       uploadId: uploadId,
       size: chunk.size,
       sha256: chunk.sha256,
+      md5: chunk.md5,
     }, reqList);
     i++;
   }
@@ -430,20 +464,20 @@ async function normalMultiPart(fileinfo) {
       });
 
       tohash.on('end', () => {
-        console.log(`True Size: ${lalasize} True sha256: ${lala.digest('hex')}`);
+        //console.log(`True Size: ${lalasize} True sha256: ${lala.digest('hex')}`);
       });
 
       let rs = fs.createReadStream(FILE, {start, end});
 
       let result = await uploadPart(reqList.requests[x], rs);
-      //console.dir(result);
-      console.log('uploaded part ' + x);
+      ////console.dir(result);
+      //console.log('uploaded part ' + x);
     }
   } catch (err) {
-    console.log('==================================');
-    console.log('Aborting failed upload');
-    //console.log(JSON.stringify(err, null, 2));
-    console.dir(err);
+    //console.log('==================================');
+    //console.log('Aborting failed upload');
+    ////console.log(JSON.stringify(err, null, 2));
+    //console.dir(err);
     let abortUpload = await awsRequest({
       hostname: `${BUCKET}.s3.amazonaws.com`,
       method: 'DELETE',
@@ -454,6 +488,7 @@ async function normalMultiPart(fileinfo) {
         'x-amz-meta-header-from-abort': 'true',
       }
     });
+    throw err;
   }
 
   
@@ -461,7 +496,7 @@ async function normalMultiPart(fileinfo) {
 
 async function main() {
   let fileinfo = await fileInfo(FILE);
-  console.log(fileinfo);
+  //console.log(fileinfo);
   await createBucket();
   await normalMultiPart(fileinfo);
   //await removeBucket();
