@@ -21,7 +21,7 @@ const KEY = process.env.KEY || 'test-file';
 const FILE = process.env.FILE || 'rando.dat';
 const REGION = process.env.REGION || 'us-east-1';
 // Default to 25mb
-const CHUNKSIZE = Number.parseInt(process.env.CHUNKSIZE) || 1024 * 1024 * 25
+const CHUNKSIZE = Number.parseInt(process.env.CHUNKSIZE) || 1024 * 1024 * 250
 
 // See https://github.com/nodejs/node/issues/2363#issuecomment-278498852
 function parseSession(buf) {
@@ -227,7 +227,6 @@ async function awsRequest(opts) {
   opts.protocol = 'https:';
   opts.signQuery = true;
   opts = aws4.sign(opts);
-  console.log(opts);
 
   //console.log(JSON.stringify(opts, null, 2));
   return new Promise((res, rej) => {
@@ -302,7 +301,6 @@ async function uploadPart(partinfo, bodyStream) {
         'X-Amz-Content-Sha256': sha256,
         'content-length': size,
         'content-type': 'application/octet-stream',
-        'content-md5': md5,
         // No metadata on part upload
         //'x-amz-meta-header-from-upload-part': 'true',
       },
@@ -310,8 +308,6 @@ async function uploadPart(partinfo, bodyStream) {
     }
 
     let signedOpts = aws4.sign(reqOpts);
-    console.log('Signed Part Upload Opts');
-    console.dir(signedOpts);
     let request = https.request(signedOpts);
 
     wiresharkRequest(request);
@@ -470,7 +466,7 @@ async function normalMultiPart(fileinfo) {
       let rs = fs.createReadStream(FILE, {start, end});
 
       let result = await uploadPart(reqList.requests[x], rs);
-      ////console.dir(result);
+      console.dir(result);
       //console.log('uploaded part ' + x);
     }
   } catch (err) {
